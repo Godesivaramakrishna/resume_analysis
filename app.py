@@ -60,6 +60,41 @@ def extract_text_from_docx(file_path):
         text += para.text
     return text
 
+# Function to validate if document is a resume
+def is_resume(text):
+    """
+    Validates if the extracted text appears to be from a resume.
+    Checks for common resume keywords and sections.
+    """
+    text_lower = text.lower()
+    
+    # Common resume keywords and sections
+    resume_keywords = [
+        'experience', 'education', 'skills', 'work experience',
+        'employment', 'qualification', 'professional', 'career',
+        'objective', 'summary', 'projects', 'certifications',
+        'achievements', 'responsibilities', 'duties', 'resume',
+        'cv', 'curriculum vitae', 'profile', 'expertise',
+        'accomplishments', 'training', 'languages', 'references'
+    ]
+    
+    # Count how many resume keywords are found
+    keyword_count = sum(1 for keyword in resume_keywords if keyword in text_lower)
+    
+    # Check minimum text length (resumes should have substantial content)
+    min_length = 100
+    
+    # Validation criteria:
+    # 1. Text should be at least 100 characters
+    # 2. Should contain at least 3 resume-related keywords
+    if len(text) < min_length:
+        return False, "Document is too short to be a resume. Please upload a complete resume."
+    
+    if keyword_count < 3:
+        return False, "This document doesn't appear to be a resume. Please upload a valid resume containing sections like Experience, Education, Skills, etc."
+    
+    return True, "Valid resume detected"
+
 @app.route("/")
 def home():
     return render_template("index.html")
@@ -114,7 +149,15 @@ def predict():
             logger.warning("Insufficient text extracted from file")
             return "Could not extract enough text from the resume. Please ensure the file is not empty or corrupted.", 400
         
-        logger.info(f"Extracted {len(text)} characters from resume")
+        logger.info(f"Extracted {len(text)} characters from document")
+        
+        # Validate if document is actually a resume
+        is_valid_resume, validation_message = is_resume(text)
+        if not is_valid_resume:
+            logger.warning(f"Non-resume document detected: {validation_message}")
+            return f"⚠️ {validation_message}", 400
+        
+        logger.info("Resume validation passed")
         
         # Transform text and predict
         input_vector = vectorizer.transform([text])
