@@ -24,12 +24,19 @@ COPY vectorizer.pkl .
 # Create uploads directory
 RUN mkdir -p uploads
 
-# Expose port 5000
+# Expose port (can be overridden with PORT env var)
 EXPOSE 5000
 
 # Set environment variables
 ENV FLASK_APP=app.py
 ENV PYTHONUNBUFFERED=1
+ENV ENV=production
+ENV HOST=0.0.0.0
+
+# Health check for container orchestration
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')" || exit 1
 
 # Run the application
 CMD ["python", "app.py"]
+

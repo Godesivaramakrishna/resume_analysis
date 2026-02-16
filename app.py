@@ -1,15 +1,48 @@
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, jsonify
 import joblib
 import os
+import tempfile
 from PyPDF2 import PdfReader
 from docx import Document
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config["UPLOAD_FOLDER"] = "uploads"
 
-# Load model
-model = joblib.load("job_role_model.pkl")
-vectorizer = joblib.load("vectorizer.pkl")
+# Environment-agnostic configuration
+# Use environment variables with fallback defaults
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", 16 * 1024 * 1024))  # 16MB default
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key-change-in-production")
+
+# Upload folder configuration - works in any environment
+# Use temp directory if uploads folder can't be created (some cloud platforms have read-only filesystems)
+UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", "uploads")
+try:
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+    logger.info(f"Upload folder set to: {UPLOAD_FOLDER}")
+except (PermissionError, OSError) as e:
+    # Fallback to system temp directory for read-only filesystems
+    app.config["UPLOAD_FOLDER"] = tempfile.gettempdir()
+    logger.warning(f"Could not create upload folder, using temp directory: {app.config['UPLOAD_FOLDER']}")
+
+# Load model files with error handling
+try:
+    MODEL_PATH = os.environ.get("MODEL_PATH", "job_role_model.pkl")
+    VECTORIZER_PATH = os.environ.get("VECTORIZER_PATH", "vectorizer.pkl")
+    
+    model = joblib.load(MODEL_PATH)
+    vectorizer = joblib.load(VECTORIZER_PATH)
+    logger.info("Model and vectorizer loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading model files: {e}")
+    raise
 
 # Function to extract text from PDF
 def extract_text_from_pdf(file_path):
@@ -31,41 +64,80 @@ def extract_text_from_docx(file_path):
 def home():
     return render_template("index.html")
 
+@app.route("/health")
+def health_check():
+    """Health check endpoint for cloud platforms and load balancers"""
+    return jsonify({
+        "status": "healthy",
+        "service": "resume-analyzer",
+        "model_loaded": model is not None,
+        "vectorizer_loaded": vectorizer is not None
+    }), 200
+
 @app.route("/predict", methods=["POST"])
 def predict():
-    file = request.files["resume"]
-
-    if file.filename == "":
-        return "No file selected"
-
-    file_path = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
-    file.save(file_path)
-
+    file_path = None
     try:
-        # Extract text
-        if file.filename.endswith(".pdf"):
+        # Validate file upload
+        if "resume" not in request.files:
+            logger.warning("No file part in request")
+            return "No file uploaded", 400
+        
+        file = request.files["resume"]
+        
+        if file.filename == "":
+            logger.warning("Empty filename received")
+            return "No file selected", 400
+        
+        # Validate file extension
+        allowed_extensions = {".pdf", ".docx"}
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in allowed_extensions:
+            logger.warning(f"Unsupported file format: {file_ext}")
+            return f"Unsupported file format. Please upload PDF or DOCX files.", 400
+        
+        # Create secure filename and save
+        import uuid
+        safe_filename = f"{uuid.uuid4()}{file_ext}"
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], safe_filename)
+        file.save(file_path)
+        logger.info(f"File saved: {safe_filename}")
+        
+        # Extract text based on file type
+        if file_ext == ".pdf":
             text = extract_text_from_pdf(file_path)
-        elif file.filename.endswith(".docx"):
+        elif file_ext == ".docx":
             text = extract_text_from_docx(file_path)
-        else:
-            return "Unsupported file format"
-
-        # Transform text
+        
+        # Validate extracted text
+        if not text or len(text.strip()) < 10:
+            logger.warning("Insufficient text extracted from file")
+            return "Could not extract enough text from the resume. Please ensure the file is not empty or corrupted.", 400
+        
+        logger.info(f"Extracted {len(text)} characters from resume")
+        
+        # Transform text and predict
         input_vector = vectorizer.transform([text])
-
-        # Get decision scores
         decision_scores = model.decision_function(input_vector)
-
+        
         # Get top 3 predictions
         top_indices = decision_scores[0].argsort()[-3:][::-1]
         top_roles = model.classes_[top_indices]
-
+        
+        logger.info(f"Prediction successful: {top_roles[0]}")
+        
+    except Exception as e:
+        logger.error(f"Error processing resume: {str(e)}")
+        return f"An error occurred while processing your resume. Please try again.", 500
+    
     finally:
         # Always delete the uploaded file after processing
-        # This ensures files are removed even if an error occurs
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"✅ Deleted uploaded file: {file.filename}")
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(f"✅ Deleted uploaded file: {safe_filename}")
+            except Exception as e:
+                logger.error(f"Error deleting file: {e}")
 
     return f"""
 <!DOCTYPE html>
@@ -379,4 +451,60 @@ def predict():
 """
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Get configuration from environment variables with sensible defaults
+    port = int(os.environ.get("PORT", 5000))
+    host = os.environ.get("HOST", "0.0.0.0")  # Default to 0.0.0.0 for cloud compatibility
+    
+    # Detect environment - check multiple cloud platform indicators
+    is_production = (
+        # Generic production indicators
+        os.environ.get("FLASK_ENV") == "production" or
+        os.environ.get("ENV") == "production" or
+        os.environ.get("ENVIRONMENT") == "production" or
+        os.environ.get("PRODUCTION") == "true" or
+        
+        # Cloud platform specific indicators
+        os.environ.get("RENDER") or  # Render
+        os.environ.get("RAILWAY_ENVIRONMENT") or  # Railway
+        os.environ.get("HEROKU") or  # Heroku
+        os.environ.get("DYNO") or  # Heroku dyno
+        
+        # AWS indicators
+        os.environ.get("AWS_EXECUTION_ENV") or  # AWS Lambda/ECS
+        os.environ.get("AWS_REGION") or  # AWS general
+        os.environ.get("EC2_INSTANCE_ID") or  # AWS EC2
+        
+        # Google Cloud indicators
+        os.environ.get("GAE_ENV") or  # Google App Engine
+        os.environ.get("GOOGLE_CLOUD_PROJECT") or  # GCP general
+        os.environ.get("K_SERVICE") or  # Google Cloud Run
+        
+        # Azure indicators
+        os.environ.get("WEBSITE_INSTANCE_ID") or  # Azure App Service
+        os.environ.get("AZURE_FUNCTIONS_ENVIRONMENT") or  # Azure Functions
+        
+        # Container/Kubernetes indicators
+        os.environ.get("KUBERNETES_SERVICE_HOST") or  # Kubernetes
+        os.environ.get("CONTAINER_NAME")  # Generic container
+    )
+    
+    # Determine debug mode
+    debug_mode = os.environ.get("DEBUG", "False").lower() == "true" and not is_production
+    
+    # Log startup information
+    logger.info(f"="*50)
+    logger.info(f"Starting Resume Analyzer Application")
+    logger.info(f"Environment: {'Production' if is_production else 'Development'}")
+    logger.info(f"Host: {host}")
+    logger.info(f"Port: {port}")
+    logger.info(f"Debug Mode: {debug_mode}")
+    logger.info(f"Upload Folder: {app.config['UPLOAD_FOLDER']}")
+    logger.info(f"="*50)
+    
+    # Run the application
+    app.run(
+        host=host,
+        port=port,
+        debug=debug_mode,
+        threaded=True  # Enable threading for better performance
+    )
