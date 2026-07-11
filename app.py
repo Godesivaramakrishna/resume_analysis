@@ -159,8 +159,20 @@ def predict():
         
         logger.info("Resume validation passed")
         
+        # Clean text (remove non-alpha, lowercase, normalize spaces)
+        import re
+        text_clean = re.sub(r'[^a-zA-Z\s]', ' ', text)
+        text_clean = re.sub(r'\s+', ' ', text_clean).strip().lower()
+        
         # Transform text and predict
-        input_vector = vectorizer.transform([text])
+        input_vector = vectorizer.transform([text_clean])
+        matched_features = input_vector.nnz
+        logger.info(f"Features matched: {matched_features}")
+        
+        if matched_features == 0:
+            logger.warning("No known keywords found in resume! Predictions will be defaults.")
+            return "⚠️ Could not find any relevant skills or keywords in your resume that match our database. Please ensure your resume clearly highlights specific technical or professional skills.", 400
+            
         decision_scores = model.decision_function(input_vector)
         
         # Get top 3 predictions

@@ -1,0 +1,203 @@
+name: Resume Analyser CI/CD
+
+# ─────────────────────────────────────────────
+# TRIGGERS: When does this pipeline run?
+# ─────────────────────────────────────────────
+on:
+  push:
+    branches: [ main, master, develop ]   # Run on every push to these branches
+  pull_request:
+    branches: [ main, master ]            # Run on PRs targeting main/master
+
+jobs:
+
+  # ════════════════════════════════════════════
+  # JOB 1: LINT & CODE QUALITY CHECK
+  # ════════════════════════════════════════════
+  lint:
+    name: 🔍 Lint & Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Download your repo code onto the runner
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Step 3: Install linting tools
+      - name: Install linting tools
+        run: |
+          pip install flake8 black
+
+      # Step 4: Check code formatting with Black
+      - name: Check formatting with Black
+        run: |
+          black --check --diff app.py
+        continue-on-error: true   # Won't fail build, just warns
+
+      # Step 5: Check for syntax errors and style issues
+      - name: Lint with Flake8
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 app.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Treat all other issues as warnings
+          flake8 app.py --count --exit-zero --max-line-length=120 --statistics
+
+  # ════════════════════════════════════════════
+  # JOB 2: TEST
+  # ════════════════════════════════════════════
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    needs: lint    # Only runs if lint job passes
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"             # Cache pip packages to speed up future runs
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # Check that the model files exist (crucial for this ML project)
+      - name: Check model files exist
+        run: |
+          echo "Checking model files..."
+          ls -lh job_role_model.pkl vectorizer.pkl
+          python -c "
+          import joblib
+          import warnings
+          warnings.filterwarnings('ignore')
+          model = joblib.load('job_role_model.pkl')
+          vectorizer = joblib.load('vectorizer.pkl')
+          print('✅ Model loaded successfully:', type(model).__name__)
+          print('✅ Vectorizer loaded successfully:', type(vectorizer).__name__)
+          print('✅ Number of classes:', len(model.classes_))
+          print('✅ Classes:', list(model.classes_))
+          "
+
+      # Test that Flask app starts correctly
+      - name: Test Flask app startup
+        run: |
+          python -c "
+          import warnings
+          warnings.filterwarnings('ignore')
+          from app import app
+          print('✅ Flask app imported successfully')
+          client = app.test_client()
+          # Test home page
+          response = client.get('/')
+          assert response.status_code == 200, f'Home page failed: {response.status_code}'
+          print('✅ Home page (/) returns 200 OK')
+          # Test health endpoint
+          response = client.get('/health')
+          assert response.status_code == 200, f'Health check failed: {response.status_code}'
+          print('✅ Health check (/health) returns 200 OK')
+          import json
+          data = json.loads(response.data)
+          assert data['status'] == 'healthy', 'Health check not healthy'
+          assert data['model_loaded'] == True, 'Model not loaded'
+          print('✅ All tests passed!')
+          "
+
+  # ════════════════════════════════════════════
+  # JOB 3: BUILD DOCKER IMAGE
+  # ════════════════════════════════════════════
+  docker-build:
+    name: 🐳 Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test    # Only runs if test job passes
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Build the Docker image to ensure Dockerfile is valid
+      - name: Build Docker image
+        run: |
+          docker build -t resume-analyser:${{ github.sha }} .
+          echo "✅ Docker image built successfully"
+
+      # Show image size info
+      - name: Show Docker image info
+        run: |
+          docker images resume-analyser:${{ github.sha }}
+
+      # Optional: Push to Docker Hub if secrets are configured
+      # Uncomment the block below and add DOCKERHUB_USERNAME + DOCKERHUB_TOKEN
+      # in GitHub → Settings → Secrets and Variables → Actions
+
+      # - name: Log in to Docker Hub
+      #   uses: docker/login-action@v3
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # - name: Push to Docker Hub
+      #   run: |
+      #     docker tag resume-analyser:${{ github.sha }} ${{ secrets.DOCKERHUB_USERNAME }}/resume-analyser:latest
+      #     docker push ${{ secrets.DOCKERHUB_USERNAME }}/resume-analyser:latest
+
+  # ════════════════════════════════════════════
+  # JOB 4: SECURITY SCAN
+  # ════════════════════════════════════════════
+  security:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: test    # Runs in parallel with docker-build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Scan for known security vulnerabilities in dependencies
+      - name: Install safety & bandit
+        run: |
+          pip install safety bandit
+
+      - name: Check dependencies for vulnerabilities
+        run: |
+          safety check -r requirements.txt --output text
+        continue-on-error: true   # Warn but don't block deployment
+
+      - name: Run Bandit security linter
+        run: |
+          bandit -r app.py -ll
+        continue-on-error: true   # Warn but don't block deployment
+
+  # ════════════════════════════════════════════
+  # JOB 5: DEPLOYMENT SUMMARY (final step)
+  # ════════════════════════════════════════════
+  summary:
+    name: ✅ Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [ lint, test, docker-build, security ]
+    if: always()   # Run this even if earlier jobs had warnings
+
+    steps:
+      - name: Print summary
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Resume Analyser CI/CD Complete"
+          echo "  Commit: ${{ github.sha }}"
+          echo "  Branch: ${{ github.ref_name }}"
+          echo "  Triggered by: ${{ github.actor }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
